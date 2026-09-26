@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "dell.deepseek-usage",
+  "name": "DeepSeek Usage",
+  "version": "1.0.0",
+  "author": "dell",
+  "description": "Display DeepSeek balance and usage in the Omarchy agents panel.",
+  "license": "MIT",
+  "kinds": ["panel"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "ui/main.qml"
+  }
+}

@@ -1,0 +1,342 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the DeepSeek usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect DeepSeek usage into one display-ready JSON record.
+
+Balance comes from the official DeepSeek API (GET /user/balance) using the
+key opencode stores in ~/.local/share/opencode/auth.json (provider id
+"deepseek", type "api"), falling back to the DEEPSEEK_API_KEY environment
+variable. DeepSeek exposes no token-usage endpoint, so local stats are
+tallied from OpenCode's SQLite database (~/.local/share/opencode/opencode.db,
+table `message`, JSON in `data` column) counting only assistant messages
+whose providerID mentions deepseek — the same read-only scan the OpenCode
+collector performs, filtered to DeepSeek models.
+
+The agents panel only ever reads the JSON this prints; it never talks to
+the API or the database directly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "deepseek"
+AGENT_NAME = "DeepSeek"
+AUTH_HELP = "Sign in to DeepSeek in opencode, or set DEEPSEEK_API_KEY."
+API_URL = "https://api.deepseek.com/user/balance"
+API_TIMEOUT = 10
+MAX_RECORD_BYTES = 1_000_000
+
+# Resource ceilings for data read from the mutable message store. Any
+# violation fails closed: the collector publishes a fresh empty-stats
+# record, never a truncated one — and never holds the whole table in
+# memory (rows stream off the cursor one at a time).
+MAX_ROWS = 50_000  # message rows examined per run
+MAX_ROW_CHARS = 10_000_000  # characters of a single message payload
+MAX_MODELS = 200  # distinct model names retained
+MAX_MODEL_NAME_LEN = 200  # characters per model name
+
+
+def opencode_db() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+
+
+def opencode_auth_key() -> str:
+    auth_file = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "auth.json"
+    try:
+        auth = json.loads(auth_file.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    entry = auth.get(AGENT_ID)
+    if isinstance(entry, dict):
+        key = str(entry.get("key") or "").strip()
+        if key:
+            return key
+    return ""
+
+
+def deepseek_api_key() -> str:
+    return opencode_auth_key() or str(os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+
+
+def date_string(value: dt.date) -> str:
+    return value.strftime("%Y-%m-%d")
+
+
+def recent_date_strings() -> list[str]:
+    today = dt.datetime.now().date()
+    return [date_string(today - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
+
+
+def number(value: Any) -> int:
+    try:
+        n = float(value or 0)
+        return round(n) if n == n else 0
+    except Exception:
+        return 0
+
+
+def money(value: Any) -> float:
+    try:
+        n = float(value or 0)
+        return n if n == n else 0.0
+    except Exception:
+        return 0.0
+
+
+def empty_stats() -> dict[str, Any]:
+    return {
+        "todayPrompts": 0,
+        "todaySessions": 0,
+        "todayTotalTokens": 0,
+        "todayTokensByModel": {},
+        "recentDays": [{"date": d, "messageCount": 0} for d in recent_date_strings()],
+        "totalPrompts": 0,
+        "totalSessions": 0,
+        "activeDates": [],
+        "activeDays": 0,
+        "modelUsage": {},
+    }
+
+
+def empty_bucket() -> dict[str, int]:
+    return {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+    }
+
+
+def fetch_balance() -> tuple[dict[str, Any] | None, str]:
+    """Return (balance, status_text). balance is None when unreachable."""
+    key = deepseek_api_key()
+    if not key:
+        return None, ""
+
+    request = urllib.request.Request(
+        API_URL,
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=API_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        return None, f"DeepSeek API error {exc.code}" + (f": {detail}" if detail else "")
+    except Exception as exc:
+        return None, f"DeepSeek API unreachable: {exc}"
+
+    infos = payload.get("balance_infos")
+    if not isinstance(infos, list) or not infos:
+        return None, "DeepSeek API returned no balance info"
+
+    # Prefer a currency that actually holds credit; otherwise the first
+    # entry so the tab still renders the (empty) ledger.
+    entry = next(
+        (info for info in infos if isinstance(info, dict) and money(info.get("total_balance")) > 0),
+        infos[0],
+    )
+    if not isinstance(entry, dict):
+        return None, "DeepSeek API returned no balance info"
+
+    remaining = money(entry.get("total_balance"))
+    funded = money(entry.get("topped_up_balance")) + money(entry.get("granted_balance"))
+    return {
+        "remaining": remaining,
+        "funded": funded,
+        "spent": max(0.0, funded - remaining),
+        "currency": str(entry.get("currency") or "USD"),
+        "estimated": False,
+    }, ""
+
+
+def scan_opencode() -> dict[str, Any]:
+    stats = empty_stats()
+    today = stats["recentDays"][-1]["date"]
+
+    db = opencode_db()
+    if not db.is_file():
+        return stats
+
+    sessions: set[str] = set()
+    today_sessions: set[str] = set()
+    active_days: set[str] = set()
+    date_tokens: dict[str, int] = {}
+    today_tokens: dict[str, int] = {}
+    model_usage: dict[str, dict[str, int]] = {}
+    prompts = 0
+    today_prompt_count = 0
+    today_token_total = 0
+
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error as exc:
+        print(f"Ignoring unreadable OpenCode database {db}: {exc}", file=sys.stderr)
+        return stats
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        try:
+            cursor = conn.execute("SELECT session_id, data FROM message")
+        except sqlite3.Error as exc:
+            print(f"Ignoring OpenCode scan error: {exc}", file=sys.stderr)
+            return stats
+
+        # Stream rows off the cursor: a long-lived database can hold large
+        # transcript JSON bodies, so the table is never materialized with
+        # fetchall() on the five-minute schedule.
+        examined = 0
+        for session_id, raw in cursor:
+            examined += 1
+            if examined > MAX_ROWS:
+                return empty_stats()
+            if not isinstance(raw, str) or len(raw) > MAX_ROW_CHARS:
+                continue
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                continue
+            provider = str(entry.get("providerID") or "").lower()
+            if "deepseek" not in provider:
+                continue
+            tokens = entry.get("tokens") or {}
+            cache = tokens.get("cache") or {}
+            input_tokens = number(tokens.get("input"))
+            output_tokens = number(tokens.get("output")) + number(tokens.get("reasoning"))
+            cache_read = number(cache.get("read"))
+            cache_write = number(cache.get("write"))
+            total = input_tokens + output_tokens + cache_read + cache_write
+            if total <= 0:
+                continue
+
+            created = number((entry.get("time") or {}).get("created"))
+            day = dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d") if created > 0 else today
+            model = str(entry.get("modelID") or "deepseek").rstrip("/").split("/")[-1]
+            if len(model) > MAX_MODEL_NAME_LEN or (model not in model_usage and len(model_usage) >= MAX_MODELS):
+                return empty_stats()
+
+            session_key = "opencode:" + str(session_id)
+            sessions.add(session_key)
+            active_days.add(day)
+            prompts += 1
+            date_tokens[day] = date_tokens.get(day, 0) + total
+
+            bucket = model_usage.setdefault(model, empty_bucket())
+            bucket["inputTokens"] += input_tokens
+            bucket["outputTokens"] += output_tokens
+            bucket["cacheReadInputTokens"] += cache_read
+            bucket["cacheCreationInputTokens"] += cache_write
+
+            if day == today:
+                today_prompt_count += 1
+                today_sessions.add(session_key)
+                today_token_total += total
+                today_tokens[model] = today_tokens.get(model, 0) + total
+    finally:
+        conn.close()
+
+    stats["todayPrompts"] = today_prompt_count
+    stats["todaySessions"] = len(today_sessions)
+    stats["todayTotalTokens"] = today_token_total
+    stats["todayTokensByModel"] = today_tokens
+    stats["totalPrompts"] = prompts
+    stats["totalSessions"] = len(sessions)
+    stats["modelUsage"] = model_usage
+    stats["activeDates"] = sorted(active_days)
+    stats["activeDays"] = len(active_days)
+    for day_entry in stats["recentDays"]:
+        day_entry["messageCount"] = date_tokens.get(day_entry["date"], 0)
+    return stats
+
+
+def build_record(stats: dict[str, Any], balance: dict[str, Any] | None, status_text: str) -> dict[str, Any]:
+    has_local = number(stats.get("totalPrompts")) > 0
+    return {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "ready": balance is not None or has_local,
+        "hasLocalStats": has_local,
+        "hasPromptStats": has_local,
+        "tierLabel": "Prepaid",
+        "usageStatusText": status_text,
+        "authHelpText": "" if balance is not None else AUTH_HELP,
+        "limits": [],
+        "balance": balance,
+        **stats,
+    }
+
+
+def write_record(payload: str) -> None:
+    home = Path(os.environ.get("HOME") or "~").expanduser()
+    state_home = Path(os.environ.get("XDG_STATE_HOME") or (home / ".local" / "state"))
+    output_dir = state_home / "omarchy" / "agents" / "usage"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"{AGENT_ID}.json"
+
+    if output_dir.is_symlink():
+        raise OSError(f"Output directory is a symlink: {output_dir}")
+    if output_file.exists() or output_file.is_symlink():
+        if output_file.is_symlink():
+            raise OSError(f"Output file is a symlink: {output_file}")
+        if not output_file.is_file():
+            raise OSError(f"Output file is not a regular file: {output_file}")
+
+    fd, temp_path = tempfile.mkstemp(dir=str(output_dir), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        shutil.move(temp_path, str(output_file))
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.add_argument("--write", action="store_true",
+                        help="Write to ~/.local/state/omarchy/agents/usage/deepseek.json instead of stdout")
+    args = parser.parse_args()
+
+    balance, status_text = fetch_balance()
+    stats = scan_opencode()
+    payload = json.dumps(build_record(stats, balance, status_text), indent=2)
+    if len(payload.encode("utf-8")) > MAX_RECORD_BYTES:
+        payload = json.dumps(build_record(empty_stats(), balance, status_text), indent=2)
+
+    if args.write:
+        try:
+            write_record(payload)
+        except (OSError, IOError) as exc:
+            print(f"deepseek-usage: write failed: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+    else:
+        print(payload)
+
+
+if __name__ == "__main__":
+    main()
