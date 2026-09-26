@@ -23,6 +23,12 @@ and
 - The agents panel picks up the new tab automatically once the JSON record
   exists. Nothing under `/usr/share/omarchy` is touched.
 
+## Install
+
+```bash
+omarchy plugin add https://github.com/jhonoryza/omarchy-deepseek-usage.git --enable
+```
+
 ## Removal
 
 ```bash
