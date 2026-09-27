@@ -39,6 +39,13 @@ API_URL = "https://api.deepseek.com/user/balance"
 API_TIMEOUT = 10
 MAX_RECORD_BYTES = 1_000_000
 
+# Ceiling for bytes read off the network before parsing. The balance
+# payload is a few hundred bytes of JSON; anything larger fails closed
+# (balance None + status text) so a rogue/oversized response can never
+# exhaust the persistent collector's memory.
+MAX_API_BYTES = 65_536  # 64KB response/error-body cap
+MAX_API_DETAIL_CHARS = 200  # error detail surfaced in the status text
+
 # Resource ceilings for data read from the mutable message store. Any
 # violation fails closed: the collector publishes a fresh empty-stats
 # record, never a truncated one — and never holds the whole table in
@@ -120,6 +127,35 @@ def empty_bucket() -> dict[str, int]:
     }
 
 
+def read_capped(stream: Any, limit: int = MAX_API_BYTES) -> bytes | None:
+    """Read at most limit bytes; return None when the stream is larger."""
+    chunks: list[bytes] = []
+    remaining = limit + 1
+    while remaining > 0:
+        chunk = stream.read(min(8192, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        return None
+    return data
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Block redirects so the bearer key never hops to another host."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> Any:  # noqa: ANN401
+        return None
+
+
+def open_https(url: str, request: urllib.request.Request) -> Any:
+    return urllib.request.build_opener(NoRedirect).open(
+        request, timeout=API_TIMEOUT)
+
+
 def fetch_balance() -> tuple[dict[str, Any] | None, str]:
     """Return (balance, status_text). balance is None when unreachable."""
     key = deepseek_api_key()
@@ -131,12 +167,17 @@ def fetch_balance() -> tuple[dict[str, Any] | None, str]:
         headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=API_TIMEOUT) as response:
-            payload = json.loads(response.read().decode("utf-8") or "{}")
+        with open_https(API_URL, request) as response:
+            raw = read_capped(response)
+            if raw is None:
+                return None, "DeepSeek API returned an oversized response"
+            payload = json.loads(raw.decode("utf-8") or "{}")
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            detail = exc.read().decode("utf-8", "replace")[:200]
+            raw = read_capped(exc, MAX_API_BYTES)
+            if raw is not None:
+                detail = raw.decode("utf-8", "replace")[:MAX_API_DETAIL_CHARS]
         except Exception:
             pass
         return None, f"DeepSeek API error {exc.code}" + (f": {detail}" if detail else "")
